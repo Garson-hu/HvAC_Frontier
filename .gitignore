@@ -1,0 +1,6 @@
+!/build/build_frontier.sh  # then remain the needed files
+!/build/clean_cmake.sh
+build/*
+
+.DS_Store
+.vscode/
