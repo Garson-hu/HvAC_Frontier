@@ -6,11 +6,12 @@
 #include <filesystem>
 #include <iostream>
 #include <assert.h>
+#include <unordered_map>
 
 #include "hvac_internal.h"
 #include "hvac_logging.h"
 #include "hvac_comm.h"
-#include "hvac_timer.h"
+#include "hvac_timer.h" // ! HVAC TIMING
 
 //* add below
 
@@ -27,7 +28,8 @@ int (*__real_close)(int fd) = NULL;
 off_t (*__real_lseek)(int fd, off_t offset, int whence) = NULL;
 off64_t (*__real_lseek64)(int fd, off64_t offset, int whence) = NULL;
 
-//* Add above
+// ! HVAC TIMING
+extern "C" void hvac_setup_detailed_logging();
 
 #define HVAC_CLIENT 1
 
@@ -42,8 +44,8 @@ char *hvac_data_dir = NULL;
 
 pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-std::map<int,std::string> fd_map;
-std::map<int, int > fd_redir_map;
+std::unordered_map<int,std::string> fd_map;
+std::unordered_map<int, int > fd_redir_map;
 
 void Initialize_function() {
     L4C_INFO("Executing Initialize_function");
@@ -88,7 +90,8 @@ static void __attribute__((constructor)) hvac_client_init()
     g_hvac_initialized = true;
 
     pthread_mutex_unlock(&init_mutex);
-    
+	//! HVAC TIMING
+	hvac_setup_detailed_logging();
 	g_disable_redirect = false;
 
 	Initialize_function();
@@ -151,16 +154,16 @@ bool hvac_track_file(const char *path, int flags, int fd)
 		
 		int host = std::hash<std::string>{}(fd_map[fd]) % g_hvac_server_count;	
 		L4C_INFO("Remote open - Host %d", host);
+		ssize_t open_result;
 		{
 			// HVAC_TIMING("CLIENT_(comm_gen_open_rpc)_dispatch");
-			hvac_client_comm_gen_open_rpc(host, fd_map[fd], fd);
-		}
-
-		// * Wait for 
-
-		{
 			// HVAC_TIMING("CLIENT_hvac_open_rpc_wait_data"); 
-			hvac_client_block();
+			open_result = hvac_client_comm_gen_open_rpc(host, fd_map[fd], fd);
+		}
+		
+		if (open_result < 0) {
+			L4C_ERR("Remote open failed for file %s", path);
+			tracked = false;  // If remote open failed, don't track the file
 		}
 	}
 
@@ -184,8 +187,7 @@ ssize_t hvac_remote_read(int fd, void *buf, size_t count)
 	if (hvac_file_tracked(fd)){
 		int host = std::hash<std::string>{}(fd_map[fd]) % g_hvac_server_count;	
 		L4C_INFO("Remote read - Host %d", host);		
-		hvac_client_comm_gen_read_rpc(host, fd, buf, count, -1);
-		bytes_read = hvac_read_block();   		
+		bytes_read = hvac_client_comm_gen_read_rpc(host, fd, buf, count, -1);
 		return bytes_read;
 	}
 	/* Non-HVAC Reads come from base */
@@ -210,12 +212,9 @@ ssize_t hvac_remote_pread(int fd, void *buf, size_t count, off_t offset)
 		L4C_INFO("Remote pread - Host %d", host);	
 		{
 			// HVAC_TIMING("CLIENT_(hvac_remote_pread)_dispatch");	
-			hvac_client_comm_gen_read_rpc(host, fd, buf, count, offset);
-		}
-		{
 			// HVAC_TIMING("CLIENT_(hvac_remote_pread)_wait_data"); 
-			bytes_read = hvac_read_block();
-		}   	
+			bytes_read = hvac_client_comm_gen_read_rpc(host, fd, buf, count, offset);
+		}
 	}
 	/* Non-HVAC Reads come from base */
 	return bytes_read;
@@ -232,8 +231,7 @@ ssize_t hvac_remote_lseek(int fd, int offset, int whence)
 	if (hvac_file_tracked(fd)){
 		int host = std::hash<std::string>{}(fd_map[fd]) % g_hvac_server_count;	
 		L4C_INFO("Remote seek - Host %d", host);		
-		hvac_client_comm_gen_seek_rpc(host, fd, offset, whence);
-		bytes_read = hvac_seek_block();   		
+		bytes_read = hvac_client_comm_gen_seek_rpc(host, fd, offset, whence);
 		return bytes_read;
 	}
 	/* Non-HVAC Reads come from base */
@@ -276,5 +274,19 @@ extern "C" {
 
 	void hvac_trigger_reset_all_stats() {
         hvac::reset_all_stats();
+    }
+}
+
+// Used for initiate the detailed logs of a specific tag
+extern "C" void hvac_setup_detailed_logging() {
+	hvac::enable_detailed_call_logging_for_tag("CLIENT_hvac_open_rpc_wait_data");
+}
+
+// Used to export detailed call history for a specific tag to a CSV file
+extern "C" void hvac_client_export_tag_details(const char* tag_name_c_str, const char* output_filename_c_str, int epoch_num) {
+    if (tag_name_c_str && output_filename_c_str) {
+        std::string tag_name(tag_name_c_str);
+        std::string output_filename(output_filename_c_str);
+        hvac::export_tag_call_history_to_file(tag_name, output_filename.c_str(), epoch_num);
     }
 }

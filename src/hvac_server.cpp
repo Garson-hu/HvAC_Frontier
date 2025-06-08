@@ -8,7 +8,7 @@
 
 #include <stdlib.h>
 #include <unistd.h>
-#include "hvac_timer.h"
+#include "hvac_timer.h"  // ! HVAC TIMING
 #include "hvac_comm.h"
 #include "hvac_data_mover_internal.h"
 
@@ -42,7 +42,6 @@ void signal_exit(int signum)
 
 int hvac_start_comm_server(void)
 {
-    // HG_Set_log_level("DEBUG");
 
     // !--- BEGIN: Write PID to file ---
     pid_t current_pid = getpid();
@@ -76,7 +75,7 @@ int hvac_start_comm_server(void)
     hvac_close_rpc_register();
     hvac_seek_rpc_register();
 
-    // ! Register the trigger RPC
+    // ! HVAC TIMING
     hvac_trigger_srv_print_stats_rpc_register(); 
 
     while (1)

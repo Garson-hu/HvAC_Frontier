@@ -7,8 +7,50 @@
 #include <iomanip>
 #include <iostream>
 #include <fstream>
-#include <cstring>
+#include <vector>
+#include <numeric>    // For std::accumulate
+#include <algorithm>  // For std::sort
+#include <set>        // For std::set to store tags for detailed logging
+#include <unistd.h>   // For getpid()
+#include <cstring>    // For strlen
+
 namespace hvac {
+
+
+inline std::mutex& get_mutex() {
+    static std::mutex m;
+    return m;
+}
+    
+
+/*
+    Used for get the tag that which HVAC_TIMING should print the single call time.
+*/
+inline std::set<std::string>& get_detailed_log_tags_set()
+{
+    static std::set<std::string> detailed_tags;
+    return detailed_tags;
+}
+
+inline void enable_detailed_call_logging_for_tag(const std::string& tag) {
+    std::lock_guard<std::mutex> lk(get_mutex());
+    get_detailed_log_tags_set().insert(tag);
+    // std::cout << "[HVAC Timer] Detailed call logging enabled for tag: " << tag << std::endl;
+}
+
+inline void disable_detailed_call_logging_for_tag(const std::string& tag)
+{
+    std::lock_guard<std::mutex> lk(get_mutex());
+    get_detailed_log_tags_set().erase(tag);
+    // std::cout << "[HVAC Timer] Detailed call logging disabled for tag: " << tag << std::endl;
+}
+
+inline std::unordered_map<std::string, std::vector<uint64_t>>& get_call_history_table()
+{
+    static std::unordered_map<std::string, std::vector<uint64_t>> call_history_table;
+    return call_history_table;
+}
+
 
 struct Stat {
     std::atomic<double> total_us{0.0};
@@ -16,12 +58,6 @@ struct Stat {
 
     // Default constructor for unordered_map when key is not found
     Stat() = default;
-    // Copy constructor (often needed if std::atomic members are present,
-    // though for map insertion, default construction and then assignment is typical)
-    // However, atomics are not copyable. We will rely on default construction
-    // by the map and then modify members.
-    // If we were to copy Stat objects, we'd need to define how to copy atomics (e.g., load values).
-    // For this specific use case with map's operator[], default construction is fine.
 };
 
 inline std::unordered_map<std::string, Stat>& get_table() {
@@ -29,42 +65,44 @@ inline std::unordered_map<std::string, Stat>& get_table() {
     return tbl;
 }
 
-inline std::mutex& get_mutex() {
-    static std::mutex m;
-    return m;
-}
-
 class TimerGuard {
-public:
-    explicit TimerGuard(const char* tag)
-        : tag_(tag), start_(std::chrono::steady_clock::now()) {}
-
-    ~TimerGuard() {
-        // Use std::chrono::steady_clock consistently
-        uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - start_).count();
-
-        auto& tbl = get_table();
-        {
-            std::lock_guard<std::mutex> lk(get_mutex());
-            auto& s = tbl[tag_]; // This might create a new Stat if tag_ doesn't exist
-
-            // Atomically add to total_us for double
-            double current_total = s.total_us.load(std::memory_order_relaxed);
+    public:
+        explicit TimerGuard(const char* tag)
+            : tag_name_str_(tag), start_(std::chrono::steady_clock::now()) { // Store tag as std::string
+              // This constructor is a good place to check if the tag exists in get_detailed_log_tags_set()
+              // if many tags are dynamically created, to avoid growing the set unnecessarily.
+              // However, for simplicity, we check in the destructor.
+          }
+    
+        ~TimerGuard() {
+            uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start_).count();
+    
+            std::lock_guard<std::mutex> lk(get_mutex()); // Acquire lock once for all modifications
+    
+            // 1. Update cumulative statistics
+            auto& cumulative_tbl = get_table();
+            auto& s_cumulative = cumulative_tbl[tag_name_str_]; // Use std::string key
+    
+            double current_total = s_cumulative.total_us.load(std::memory_order_relaxed);
             double new_total;
             do {
                 new_total = current_total + static_cast<double>(us);
-            } while (!s.total_us.compare_exchange_weak(current_total, new_total,
-                                                      std::memory_order_release, // or acq_rel
-                                                      std::memory_order_relaxed));
-            // current_total is updated by compare_exchange_weak on failure, so loop continues with fresh value
-
-            s.calls.fetch_add(1, std::memory_order_relaxed);
+            } while (!s_cumulative.total_us.compare_exchange_weak(current_total, new_total,
+                                                                  std::memory_order_release,
+                                                                  std::memory_order_relaxed));
+            s_cumulative.calls.fetch_add(1, std::memory_order_relaxed);
+    
+            // 2. Conditionally log individual call duration for detailed analysis
+            const auto& detailed_tags_to_log = get_detailed_log_tags_set();
+            if (detailed_tags_to_log.count(tag_name_str_)) {
+                auto& call_history_tbl = get_call_history_table();
+                call_history_tbl[tag_name_str_].push_back(us);
+            }
         }
-    }
-private:
-    const char* tag_;
-    std::chrono::steady_clock::time_point start_;
+    private:
+        std::string tag_name_str_; // Store tag as std::string to ensure its lifetime and for map key
+        std::chrono::steady_clock::time_point start_;
 };
 
 
@@ -114,7 +152,68 @@ inline void reset_all_stats() {
         pair_in_map.second.total_us.store(0.0, std::memory_order_relaxed);
         pair_in_map.second.calls.store(0, std::memory_order_relaxed);
     }
+
+    // Reset detailed call history table for enabled tags
+    auto& call_history_tbl = get_call_history_table();
+    const auto& detailed_tags_to_reset = get_detailed_log_tags_set(); // Read the set of tags
+    for (const std::string& tag : detailed_tags_to_reset) {
+        if (call_history_tbl.count(tag)) {
+            call_history_tbl[tag].clear();
+           
+        }
+    }
+
     std::cout << "! HVAC Timing Stats have been RESET  !" << std::endl;
+}
+
+
+/*
+    Function to write all the recorded call history for a specific tag to a CSV file.
+*/
+inline void export_tag_call_history_to_file(const std::string& tag_to_export, const char* filename, int epoch_num = -1) {
+    if (!filename || strlen(filename) == 0) {
+        std::cerr << "Error: export_tag_call_history_to_file called with invalid or empty filename." << std::endl;
+        return;
+    }
+
+    // Open in append mode so multiple calls (e.g. per epoch for the same tag) append.
+    std::ofstream outfile(filename, std::ios_base::app); 
+    if (!outfile.is_open()) {
+        std::cerr << "Error: Could not open file '" << filename << "' for writing detailed call history for tag '" << tag_to_export << "'." << std::endl;
+        return;
+    }
+    
+    outfile << "\n=== HVAC Detailed Call History for Tag: \"" << tag_to_export << "\" (";
+    if (epoch_num >= 0) {
+        outfile << ", For Client Epoch: " << epoch_num; // client's epoch context
+    }
+    outfile << ") ===\n";
+    outfile << "Call_Index,Duration_us\n"; // CSV Header
+
+    size_t calls_exported = 0;
+    {
+        std::lock_guard<std::mutex> lk(get_mutex()); // Protect access to call_history_tbl
+        auto& call_history_tbl = get_call_history_table();
+        auto it = call_history_tbl.find(tag_to_export);
+        // outfile << "tag print" << it->first << std::endl;
+        if (it != call_history_tbl.end()) 
+        {
+            const auto& durations = it->second;
+            for (size_t i = 0; i < durations.size(); ++i) {
+                outfile << (i + 1) << "," << durations[i] << "\n";
+                calls_exported++;
+            }
+            if (durations.empty()) {
+                outfile << "(No calls recorded for this tag in this period/since last reset)\n";
+            }
+        } else 
+        {
+            outfile << "(Tag \"" << tag_to_export << "\" not found in detailed history or not enabled for detailed logging)\n";
+        }
+    }
+    outfile << "--- End of detailed history for tag: \"" << tag_to_export << "\" (Exported " << calls_exported << " calls) ---\n";
+    outfile << "==============================================================================\n";
+    outfile.close();
 }
 
 

@@ -1,6 +1,6 @@
 #include "hvac_comm.h"
 #include "hvac_data_mover_internal.h"
-#include "hvac_timer.h"
+#include "hvac_timer.h" // ! HVAC TIMING
 
 extern "C" {
 #include "hvac_logging.h"
@@ -270,10 +270,10 @@ hvac_close_rpc_handler(hg_handle_t handle)
     {
         L4C_INFO("Caching %s",fd_to_path[in.fd].c_str());
         pthread_mutex_lock(&data_mutex);
-        pthread_cond_signal(&data_cond);
         data_queue.push(fd_to_path[in.fd]);
+        pthread_cond_signal(&data_cond);
         pthread_mutex_unlock(&data_mutex);
-    }
+    }   
 
 	fd_to_path.erase(in.fd);
     return (hg_return_t)ret;

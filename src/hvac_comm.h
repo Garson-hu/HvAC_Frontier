@@ -46,12 +46,13 @@ hg_context_t *hvac_comm_get_context();
 
 
 //Client
-void hvac_client_comm_gen_seek_rpc(uint32_t svr_hash, int fd, int offset, int whence);
-void hvac_client_comm_gen_read_rpc(uint32_t svr_hash, int localfd, void* buffer, ssize_t count, off_t offset);
-void hvac_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd);
+ssize_t hvac_client_comm_gen_seek_rpc(uint32_t svr_hash, int fd, int offset, int whence);
+ssize_t hvac_client_comm_gen_read_rpc(uint32_t svr_hash, int localfd, void* buffer, ssize_t count, off_t offset);
+ssize_t hvac_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd);
 void hvac_client_comm_gen_close_rpc(uint32_t svr_hash, int fd);
 hg_addr_t hvac_client_comm_lookup_addr(int rank);
 void hvac_client_comm_register_rpc();
+// Legacy functions - now deprecated
 void hvac_client_block();
 ssize_t hvac_read_block();
 ssize_t hvac_seek_block();
@@ -76,6 +77,8 @@ extern "C" {
 // server_rank_identifier: String identifying the target server (e.g., "0")
 // Returns 0 on successful RPC send and server ACK, non-zero otherwise.
 int hvac_client_request_server_to_print_stats(const char* server_rank_identifier);
+void hvac_client_export_tag_details(const char* tag_name_c_str, const char* output_filename_c_str, int epoch_num);
+
 
 #ifdef __cplusplus
 }
