@@ -154,6 +154,7 @@ void hvac_comm_list_addr()
 static hg_return_t
 hvac_rpc_handler_bulk_cb(const struct hg_cb_info *info)
 {
+    HVAC_TIMING("HvacComm_(hvac_rpc_handler_bulk_cb)_total");
     struct hvac_rpc_state *hvac_rpc_state_p = (struct hvac_rpc_state*)info->arg;
     int ret;
     hvac_rpc_out_t out;
@@ -177,6 +178,7 @@ hvac_rpc_handler_bulk_cb(const struct hg_cb_info *info)
 static hg_return_t
 hvac_rpc_handler(hg_handle_t handle)
 {
+    HVAC_TIMING("HvacComm_(hvac_rpc_handler)_total");
     int ret;
     struct hvac_rpc_state *hvac_rpc_state_p;
     const struct hg_info *hgi;
@@ -193,8 +195,6 @@ hvac_rpc_handler(hg_handle_t handle)
 
     hvac_rpc_state_p->size = hvac_rpc_state_p->in.input_val;
     hvac_rpc_state_p->handle = handle;
-
-
 
     /* register local target buffer for bulk access */
 
@@ -235,6 +235,7 @@ hvac_rpc_handler(hg_handle_t handle)
 static hg_return_t
 hvac_open_rpc_handler(hg_handle_t handle)
 {
+    HVAC_TIMING("HvacComm_(hvac_open_rpc_handler)_total");
     hvac_open_in_t in;
     hvac_open_out_t out;    
     int ret = HG_Get_input(handle, &in);
@@ -257,6 +258,7 @@ hvac_open_rpc_handler(hg_handle_t handle)
 static hg_return_t
 hvac_close_rpc_handler(hg_handle_t handle)
 {
+    HVAC_TIMING("HvacComm_(hvac_close_rpc_handler)_total");
     hvac_close_in_t in;
     int ret = HG_Get_input(handle, &in);
     assert(ret == HG_SUCCESS);

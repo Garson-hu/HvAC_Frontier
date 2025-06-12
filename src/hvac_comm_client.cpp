@@ -2,6 +2,10 @@
 #include <iostream>
 #include <map>	
 #include <unordered_map>
+#include <memory>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
 
 #include "hvac_timer.h"  // ! HVAC TIMING
 #include "hvac_comm.h"
@@ -31,6 +35,139 @@ struct hvac_sync_context {
         pthread_mutex_destroy(&done_mutex);
     }
 };
+
+/* File descriptor state management to prevent race conditions */
+enum hvac_fd_state {
+    HVAC_FD_OPENING = 1,    // Open RPC in progress
+    HVAC_FD_READY = 2,      // Open completed, ready for I/O
+    HVAC_FD_ERROR = 3       // Open failed
+};
+
+struct hvac_fd_status {
+    enum hvac_fd_state state;
+    pthread_mutex_t state_mutex;
+    pthread_cond_t ready_cond;
+    
+    hvac_fd_status() : state(HVAC_FD_OPENING) {
+        pthread_mutex_init(&state_mutex, NULL);
+        pthread_cond_init(&ready_cond, NULL);
+    }
+    
+    ~hvac_fd_status() {
+        pthread_mutex_destroy(&state_mutex);
+        pthread_cond_destroy(&ready_cond);
+    }
+};
+
+// Global file descriptor state management with sharding to reduce lock contention
+#define FD_STATE_SHARDS 64
+static std::unordered_map<int, std::shared_ptr<hvac_fd_status>> fd_state_map;
+static pthread_rwlock_t fd_state_map_rwlocks[FD_STATE_SHARDS];
+static bool fd_state_rwlocks_initialized = false;
+
+// Initialize shard rwlocks once
+void init_fd_state_rwlocks() {
+    if (!fd_state_rwlocks_initialized) {
+        for (int i = 0; i < FD_STATE_SHARDS; i++) {
+            pthread_rwlock_init(&fd_state_map_rwlocks[i], NULL);
+        }
+        fd_state_rwlocks_initialized = true;
+    }
+}
+
+// Get appropriate rwlock for a file descriptor
+pthread_rwlock_t* get_fd_rwlock(int fd) {
+    init_fd_state_rwlocks();
+    return &fd_state_map_rwlocks[fd % FD_STATE_SHARDS];
+}
+
+std::shared_ptr<hvac_fd_status> hvac_get_fd_status(int fd) {
+    pthread_rwlock_t* rwlock = get_fd_rwlock(fd);
+    pthread_rwlock_rdlock(rwlock);  // Read lock for lookup
+    auto it = fd_state_map.find(fd);
+    std::shared_ptr<hvac_fd_status> status = nullptr;
+    if (it != fd_state_map.end()) {
+        status = it->second;
+    }
+    pthread_rwlock_unlock(rwlock);
+    return status;
+}
+
+void hvac_set_fd_opening(int fd) {
+    HVAC_TIMING("HvacCommClient_(hvac_set_fd_opening)_total");
+    pthread_rwlock_t* rwlock = get_fd_rwlock(fd);
+    pthread_rwlock_wrlock(rwlock);  // Write lock for modification
+    auto status = std::make_shared<hvac_fd_status>();
+    status->state = HVAC_FD_OPENING;
+    fd_state_map[fd] = status;
+    pthread_rwlock_unlock(rwlock);
+}
+
+void hvac_set_fd_ready(int fd) {
+    HVAC_TIMING("HvacCommClient_(hvac_set_fd_ready)_total");
+    auto status = hvac_get_fd_status(fd);
+    if (status) {
+        pthread_mutex_lock(&status->state_mutex);
+        status->state = HVAC_FD_READY;
+        pthread_cond_broadcast(&status->ready_cond);  // Wake up all waiting threads
+        pthread_mutex_unlock(&status->state_mutex);
+    }
+}
+
+void hvac_set_fd_error(int fd) {
+    auto status = hvac_get_fd_status(fd);
+    if (status) {
+        pthread_mutex_lock(&status->state_mutex);
+        status->state = HVAC_FD_ERROR;
+        pthread_cond_broadcast(&status->ready_cond);  // Wake up all waiting threads
+        pthread_mutex_unlock(&status->state_mutex);
+    }
+}
+
+bool hvac_wait_fd_ready(int fd, int timeout_ms = 5000) {
+    HVAC_TIMING("HvacCommClient_(hvac_wait_fd_ready)_total");
+    auto status = hvac_get_fd_status(fd);
+    if (!status) return false;
+    
+    pthread_mutex_lock(&status->state_mutex);
+    
+    // If already ready or error, return immediately
+    if (status->state == HVAC_FD_READY || status->state == HVAC_FD_ERROR) {
+        bool ready = (status->state == HVAC_FD_READY);
+        pthread_mutex_unlock(&status->state_mutex);
+        return ready;
+    }
+    
+    // Wait for the state to change with timeout
+    struct timespec timeout_ts;
+    clock_gettime(CLOCK_REALTIME, &timeout_ts);
+    timeout_ts.tv_sec += timeout_ms / 1000;
+    timeout_ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    if (timeout_ts.tv_nsec >= 1000000000) {
+        timeout_ts.tv_sec++;
+        timeout_ts.tv_nsec -= 1000000000;
+    }
+    
+    while (status->state == HVAC_FD_OPENING) {
+        int ret = pthread_cond_timedwait(&status->ready_cond, &status->state_mutex, &timeout_ts);
+        if (ret == ETIMEDOUT) {
+            L4C_ERR("Timeout waiting for fd %d to be ready", fd);
+            pthread_mutex_unlock(&status->state_mutex);
+            return false;
+        }
+    }
+    
+    bool ready = (status->state == HVAC_FD_READY);
+    pthread_mutex_unlock(&status->state_mutex);
+    return ready;
+}
+
+void hvac_cleanup_fd_state(int fd) {
+    pthread_rwlock_t* rwlock = get_fd_rwlock(fd);
+    pthread_rwlock_wrlock(rwlock);  // Write lock for deletion
+    fd_state_map.erase(fd);
+    pthread_rwlock_unlock(rwlock);
+}
 
 /* RPC Globals */
 static hg_id_t hvac_client_rpc_id;
@@ -86,7 +223,7 @@ hvac_seek_cb(const struct hg_cb_info *info)
     pthread_mutex_lock(&seek_state->sync_ctx->done_mutex);
     seek_state->sync_ctx->done = HG_TRUE;
     seek_state->sync_ctx->result = bytes_read;
-    pthread_cond_signal(&seek_state->sync_ctx->done_cond);
+    pthread_cond_broadcast(&seek_state->sync_ctx->done_cond);
     pthread_mutex_unlock(&seek_state->sync_ctx->done_mutex);
     
     // Don't free seek_state here - it will be freed by the waiting thread
@@ -96,12 +233,22 @@ hvac_seek_cb(const struct hg_cb_info *info)
 static hg_return_t
 hvac_open_cb(const struct hg_cb_info *info)
 {
+    HVAC_TIMING("HvacCommClient_(hvac_open_cb)_total");
     hvac_open_out_t out;
     struct hvac_open_state *open_state = (struct hvac_open_state *)info->arg;    
     assert(info->ret == HG_SUCCESS);
     HG_Get_output(info->info.forward.handle, &out);    
-    fd_redir_map[open_state->local_fd] = out.ret_status;
-    L4C_INFO("Open RPC Returned FD %d\n",out.ret_status);
+    
+    // Update file descriptor mapping and state
+    if (out.ret_status > 0) {
+        fd_redir_map[open_state->local_fd] = out.ret_status;
+        hvac_set_fd_ready(open_state->local_fd);  // Mark FD as ready for I/O
+        L4C_INFO("Open RPC Returned FD %d - marked as ready\n", out.ret_status);
+    } else {
+        hvac_set_fd_error(open_state->local_fd);  // Mark FD as error
+        L4C_ERR("Open RPC failed with status %d\n", out.ret_status);
+    }
+    
     HG_Free_output(info->info.forward.handle, &out);
     HG_Destroy(info->info.forward.handle);
 
@@ -109,7 +256,7 @@ hvac_open_cb(const struct hg_cb_info *info)
     pthread_mutex_lock(&open_state->sync_ctx->done_mutex);
     open_state->sync_ctx->done = HG_TRUE;
     open_state->sync_ctx->result = out.ret_status;
-    pthread_cond_signal(&open_state->sync_ctx->done_cond);
+    pthread_cond_broadcast(&open_state->sync_ctx->done_cond);
     pthread_mutex_unlock(&open_state->sync_ctx->done_mutex);
     
     // Don't free open_state here - it will be freed by the waiting thread
@@ -121,6 +268,7 @@ hvac_open_cb(const struct hg_cb_info *info)
 static hg_return_t
 hvac_read_cb(const struct hg_cb_info *info)
 {
+    HVAC_TIMING("HvacCommClient_(hvac_read_cb)_total");
     hg_return_t ret;
     hvac_rpc_out_t out;
     ssize_t bytes_read = -1;
@@ -145,7 +293,7 @@ hvac_read_cb(const struct hg_cb_info *info)
     pthread_mutex_lock(&hvac_rpc_state_p->sync_ctx->done_mutex);
     hvac_rpc_state_p->sync_ctx->done = HG_TRUE;
     hvac_rpc_state_p->sync_ctx->result = bytes_read;
-    pthread_cond_signal(&hvac_rpc_state_p->sync_ctx->done_cond);
+    pthread_cond_broadcast(&hvac_rpc_state_p->sync_ctx->done_cond);
     pthread_mutex_unlock(&hvac_rpc_state_p->sync_ctx->done_mutex);
     
     // Free the RPC state but not the sync context (caller will handle that)
@@ -167,18 +315,21 @@ void hvac_client_comm_register_rpc()
 // Updated to use individual sync context
 ssize_t hvac_wait_for_operation(struct hvac_sync_context *sync_ctx, const char* operation_name)
 {
-    // HVAC_TIMING("HvacCommClient_(hvac_client_block)_total");
+    HVAC_TIMING("HvacCommClient_(hvac_wait_for_operation)_total");
     ssize_t result;
     
     /* wait for callbacks to finish using individual sync context */
-    pthread_mutex_lock(&sync_ctx->done_mutex);
-    while (sync_ctx->done != HG_TRUE) {
-        pthread_cond_wait(&sync_ctx->done_cond, &sync_ctx->done_mutex);
+        pthread_mutex_lock(&sync_ctx->done_mutex); 
+    {
+        HVAC_TIMING("HvacCommClient_(hvac_wait_for_operation)_wait_for_done");
+        while (sync_ctx->done != HG_TRUE) {
+            pthread_cond_wait(&sync_ctx->done_cond, &sync_ctx->done_mutex);
+        }
     }
     result = sync_ctx->result;
     pthread_mutex_unlock(&sync_ctx->done_mutex);
-    
-    L4C_INFO("Operation %s completed with result: %zd", operation_name, result);
+
+    // L4C_INFO("Operation %s completed with result: %zd", operation_name, result);
     return result;
 }
 
@@ -207,6 +358,7 @@ ssize_t hvac_seek_block()
 
 void hvac_client_comm_gen_close_rpc(uint32_t svr_hash, int fd)
 {   
+    HVAC_TIMING("HvacCommClient_(hvac_client_comm_gen_close_rpc)_total");
     hg_addr_t svr_addr; 
     hvac_close_in_t in;
     hg_handle_t handle; 
@@ -218,22 +370,33 @@ void hvac_client_comm_gen_close_rpc(uint32_t svr_hash, int fd)
     /* create create handle to represent this rpc operation */
     hvac_comm_create_handle(svr_addr, hvac_client_close_id, &handle);
 
-    in.fd = fd_redir_map[fd];
+    // Check if we have a valid remote FD to close
+    if (fd_redir_map.find(fd) != fd_redir_map.end() && fd_redir_map[fd] != 0) {
+        in.fd = fd_redir_map[fd];
+        
+        ret = HG_Forward(handle, NULL, NULL, &in);
+        if (ret != 0) {
+            L4C_ERR("Failed to send close RPC for fd %d", fd);
+        }
+        
+        // Clean up mapping regardless of RPC success
+        fd_redir_map.erase(fd);
+    } else {
+        L4C_WARN("No remote FD mapping found for fd %d during close", fd);
+    }
 
-    ret = HG_Forward(handle, NULL, NULL, &in);
-    assert(ret == 0);
-
-    fd_redir_map.erase(fd);
+    // Clean up FD state tracking
+    hvac_cleanup_fd_state(fd);
 
     HG_Destroy(handle);
     hvac_comm_free_addr(svr_addr);
 
     return;
-
 }
 
 ssize_t hvac_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd)
 {
+    // HVAC_TIMING("HvacCommClient_(hvac_client_comm_gen_open_rpc)_total");
     hg_addr_t svr_addr;
     hvac_open_in_t in;
     hg_handle_t handle;
@@ -242,8 +405,14 @@ ssize_t hvac_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd)
     int ret;
     ssize_t result = -1;
 
+    // Initialize FD state as opening before starting RPC
+    hvac_set_fd_opening(fd);
+
     /* Get address */
-    svr_addr = hvac_client_comm_lookup_addr(svr_hash);    
+    {
+        HVAC_TIMING("HvacCommClient_(hvac_client_comm_gen_open_rpc)_addr_lookup");
+        svr_addr = hvac_client_comm_lookup_addr(svr_hash);
+    } 
 
     /* Allocate args for callback pass through */
     hvac_open_state_p = (struct hvac_open_state *)malloc(sizeof(*hvac_open_state_p));
@@ -257,12 +426,22 @@ ssize_t hvac_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd)
     sprintf(in.path,"%s",path.c_str());
     
     ret = HG_Forward(handle, hvac_open_cb, hvac_open_state_p, &in);
-    assert(ret == 0);
+    if (ret != 0) {
+        // If RPC dispatch failed, mark as error
+        hvac_set_fd_error(fd);
+        free(hvac_open_state_p);
+        free(in.path);
+        hvac_comm_free_addr(svr_addr);
+        return -1;
+    }
 
     hvac_comm_free_addr(svr_addr);
 
     // Wait for the operation to complete using individual sync context
-    result = hvac_wait_for_operation(&sync_ctx, "OPEN");
+    {
+        HVAC_TIMING("HvacCommClient_(hvac_client_comm_gen_open_rpc)_wait_for_operation");
+        result = hvac_wait_for_operation(&sync_ctx, "OPEN");
+    }
     
     // Clean up resources
     free(hvac_open_state_p);
@@ -273,6 +452,7 @@ ssize_t hvac_client_comm_gen_open_rpc(uint32_t svr_hash, string path, int fd)
 
 ssize_t hvac_client_comm_gen_read_rpc(uint32_t svr_hash, int localfd, void *buffer, ssize_t count, off_t offset)
 {
+    HVAC_TIMING("HvacCommClient_(hvac_client_comm_gen_read_rpc)_total");
     hg_addr_t svr_addr;
     hvac_rpc_in_t in;
     const struct hg_info *hgi;
@@ -280,6 +460,21 @@ ssize_t hvac_client_comm_gen_read_rpc(uint32_t svr_hash, int localfd, void *buff
     struct hvac_rpc_state *hvac_rpc_state_p;
     struct hvac_sync_context sync_ctx;  // Individual sync context
     ssize_t result = -1;
+
+    // Wait for FD to be ready before proceeding with read
+    {
+        HVAC_TIMING("HvacCommClient_(hvac_client_comm_gen_read_rpc)_wait_fd_ready");
+        if (!hvac_wait_fd_ready(localfd)) {
+        L4C_ERR("File descriptor %d not ready for read operation", localfd);
+        return -1;
+    }
+    }
+
+    // Double-check that we have a valid remote FD mapping
+    if (fd_redir_map.find(localfd) == fd_redir_map.end() || fd_redir_map[localfd] == 0) {
+        L4C_ERR("No valid remote FD mapping for local fd %d", localfd);
+        return -1;
+    }
 
     /* Get address */
     svr_addr = hvac_client_comm_lookup_addr(svr_hash);
@@ -310,31 +505,27 @@ ssize_t hvac_client_comm_gen_read_rpc(uint32_t svr_hash, int localfd, void *buff
      * input struct.  It was set above.
      */
     in.input_val = count;
-    //Convert FD to remote FD
+    //Convert FD to remote FD - now safe since we verified it exists
     in.accessfd = fd_redir_map[localfd];
-    /*
-    if(in.accessfd == 0) {
-	fprintf(stderr, "accessfd is 0, localfd is %d\n", localfd);
-	fprintf(stderr, "input_val is %ld and size is %ld\n", count, hvac_rpc_state_p->size);
-	bool tracked = hvac_file_tracked(localfd);
-	fprintf(stderr, "hvac file tracked is %s\n", tracked ? "true" : "false");
-	fprintf(stderr, "hvac file tracked : %s\n", fd_map[localfd].c_str());
-	//while (!fd_redir_map[localfd]);
-	in.accessfd = fd_redir_map[localfd];
-	fprintf(stderr, "redirection map filled\n");
-	}
-     */    
-	in.offset = offset;
-    
+    in.offset = offset;
     
     ret = HG_Forward(hvac_rpc_state_p->handle, hvac_read_cb, hvac_rpc_state_p, &in);
-    assert(ret == 0);
+    if (ret != 0) {
+        // Clean up on failure
+        HG_Bulk_free(hvac_rpc_state_p->bulk_handle);
+        HG_Destroy(hvac_rpc_state_p->handle);
+        free(hvac_rpc_state_p);
+        hvac_comm_free_addr(svr_addr);
+        return -1;
+    }
 
     hvac_comm_free_addr(svr_addr);
 
     // Wait for the operation to complete using individual sync context
-    result = hvac_wait_for_operation(&sync_ctx, "READ");
-    
+    {
+        HVAC_TIMING("HvacCommClient_(hvac_client_comm_gen_read_rpc)_wait_for_operation");
+        result = hvac_wait_for_operation(&sync_ctx, "READ");
+    }    
     // Note: hvac_rpc_state_p is freed in the callback, sync_ctx is stack-allocated
     return result;
 }

@@ -116,7 +116,7 @@ inline void print_all_stats(int epoch_num = -1) { // Default to -1 if no epoch n
     ss << ") ===\n";
 
     // Use constants for column widths for easier adjustment
-    const int section_col_width = 45; // Increased width for potentially longer tags from client side
+    const int section_col_width = 75; // Increased width for potentially longer tags from client side
     const int calls_col_width = 12;
     const int total_us_col_width = 18; // Made wider to accommodate larger numbers and precision
     const int avg_us_col_width = 15;
@@ -218,8 +218,6 @@ inline void export_tag_call_history_to_file(const std::string& tag_to_export, co
 
 
 inline void export_all_stats_to_file(const char* filename, int epoch_num = -1) {
-    // (Implementation from previous answer: opens ofstream, writes formatted stats, closes)
-    // (It includes error checking for filename and file opening)
     if (!filename || strlen(filename) == 0) {
         std::cerr << "Error: export_all_stats_to_file called with invalid filename. Printing to console instead." << std::endl;
         print_all_stats(epoch_num); // Fallback to printing to console
@@ -235,9 +233,9 @@ inline void export_all_stats_to_file(const char* filename, int epoch_num = -1) {
 
     // Get current process ID to make logs more distinguishable if multiple servers write logs
 
-    outfile << std::left << std::setw(45) << "Section" // Increased width for potentially longer tags
+    outfile << std::left << std::setw(75) << "Section" // Increased width for potentially longer tags
             << std::right << std::setw(12) << "Calls"
-            << std::setw(15) << "Total(us)"
+            << std::setw(18) << "Total(us)"
             << std::setw(15) << "Avg(us)"
             << "\n-----------------------------------------------------------------------------------\n"; // Adjusted line
 

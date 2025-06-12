@@ -50,7 +50,7 @@ std::unordered_map<int, int > fd_redir_map;
 void Initialize_function() {
     L4C_INFO("Executing Initialize_function");
     {
-        // HVAC_TIMING("Initialize_timer");
+        HVAC_TIMING("Initialize_timer");
         // Do some trivial work or sleep for a short time
         for (volatile int i = 0; i < 10000; ++i); // volatile to prevent optimization
     } // TimerGuard for "guaranteed_test_timer" destroyed here
@@ -104,7 +104,7 @@ static void __attribute((destructor)) hvac_client_shutdown()
 
 bool hvac_track_file(const char *path, int flags, int fd)
 {   
-	// HVAC_TIMING("CLIENT_(hvac_track_file)_total");    
+	HVAC_TIMING("CLIENT_(hvac_track_file)_total");    
 	if (strstr(path, ".ports.cfg.") != NULL)
 	{
 		return false;
@@ -156,8 +156,7 @@ bool hvac_track_file(const char *path, int flags, int fd)
 		L4C_INFO("Remote open - Host %d", host);
 		ssize_t open_result;
 		{
-			// HVAC_TIMING("CLIENT_(comm_gen_open_rpc)_dispatch");
-			// HVAC_TIMING("CLIENT_hvac_open_rpc_wait_data"); 
+			HVAC_TIMING("CLIENT_(comm_gen_open_rpc)_dispatch");
 			open_result = hvac_client_comm_gen_open_rpc(host, fd_map[fd], fd);
 		}
 		
@@ -177,7 +176,7 @@ bool hvac_track_file(const char *path, int flags, int fd)
  */
 ssize_t hvac_remote_read(int fd, void *buf, size_t count)
 {
-	// HVAC_TIMING("CLIENT_(hvac_remote_read)_total");
+	HVAC_TIMING("CLIENT_(hvac_remote_read)_total");
 	/* HVAC Code */
 	/* Check the local fd - if it's tracked we pass it to the RPC function
 	 * The local FD is converted to the remote FD with the buf and count
@@ -186,8 +185,11 @@ ssize_t hvac_remote_read(int fd, void *buf, size_t count)
 	ssize_t bytes_read = -1;
 	if (hvac_file_tracked(fd)){
 		int host = std::hash<std::string>{}(fd_map[fd]) % g_hvac_server_count;	
-		L4C_INFO("Remote read - Host %d", host);		
-		bytes_read = hvac_client_comm_gen_read_rpc(host, fd, buf, count, -1);
+		L4C_INFO("Remote read - Host %d", host);	
+		{
+			HVAC_TIMING("CLIENT_(hvac_remote_read)_dispatch");
+			bytes_read = hvac_client_comm_gen_read_rpc(host, fd, buf, count, -1);
+		}	
 		return bytes_read;
 	}
 	/* Non-HVAC Reads come from base */
@@ -200,7 +202,7 @@ ssize_t hvac_remote_read(int fd, void *buf, size_t count)
  */
 ssize_t hvac_remote_pread(int fd, void *buf, size_t count, off_t offset)
 {
-	// HVAC_TIMING("CLIENT_(hvac_remote_pread)_total");
+	HVAC_TIMING("CLIENT_(hvac_remote_pread)_total");
 	/* HVAC Code */
 	/* Check the local fd - if it's tracked we pass it to the RPC function
 	 * The local FD is converted to the remote FD with the buf and count
@@ -211,8 +213,7 @@ ssize_t hvac_remote_pread(int fd, void *buf, size_t count, off_t offset)
 		int host = std::hash<std::string>{}(fd_map[fd]) % g_hvac_server_count;	
 		L4C_INFO("Remote pread - Host %d", host);	
 		{
-			// HVAC_TIMING("CLIENT_(hvac_remote_pread)_dispatch");	
-			// HVAC_TIMING("CLIENT_(hvac_remote_pread)_wait_data"); 
+			HVAC_TIMING("CLIENT_(hvac_remote_pread)_dispatch");	
 			bytes_read = hvac_client_comm_gen_read_rpc(host, fd, buf, count, offset);
 		}
 	}
@@ -247,13 +248,13 @@ void hvac_remote_close(int fd){
 
 bool hvac_file_tracked(int fd)
 {
-	// HVAC_TIMING("CLIENT_(hvac_file_tracked)_total");
+	HVAC_TIMING("CLIENT_(hvac_file_tracked)_total");
 	return (fd_map.find(fd) != fd_map.end());
 }
 
 const char * hvac_get_path(int fd)
 {	
-	// HVAC_TIMING("CLIENT_(hvac_get_path)_total");
+	HVAC_TIMING("CLIENT_(hvac_get_path)_total");
 	if (fd_map.find(fd) != fd_map.end())
 	{
 		return fd_map[fd].c_str();
