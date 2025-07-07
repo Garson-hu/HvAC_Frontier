@@ -36,7 +36,9 @@ struct hvac_sync_context {
     }
 };
 
-/* File descriptor state management to prevent race conditions */
+/* Per-file synchronization mechanism per teacher's recommendation */
+/* Each file gets its own condition variable shared by open and subsequent reads */
+
 enum hvac_fd_state {
     HVAC_FD_OPENING = 1,    // Open RPC in progress
     HVAC_FD_READY = 2,      // Open completed, ready for I/O
@@ -59,11 +61,34 @@ struct hvac_fd_status {
     }
 };
 
+/* Per-file synchronization context - shared by all operations on the same file */
+struct hvac_file_sync_context {
+    hg_bool_t operation_done;
+    ssize_t operation_result;
+    pthread_cond_t operation_cond;
+    pthread_mutex_t operation_mutex;
+    int ref_count;  // Reference count for cleanup
+    
+    hvac_file_sync_context() : operation_done(HG_FALSE), operation_result(-1), ref_count(1) {
+        pthread_cond_init(&operation_cond, NULL);
+        pthread_mutex_init(&operation_mutex, NULL);
+    }
+    
+    ~hvac_file_sync_context() {
+        pthread_cond_destroy(&operation_cond);
+        pthread_mutex_destroy(&operation_mutex);
+    }
+};
+
 // Global file descriptor state management with sharding to reduce lock contention
 #define FD_STATE_SHARDS 64
 static std::unordered_map<int, std::shared_ptr<hvac_fd_status>> fd_state_map;
 static pthread_rwlock_t fd_state_map_rwlocks[FD_STATE_SHARDS];
 static bool fd_state_rwlocks_initialized = false;
+
+// Per-file synchronization mapping - filename to sync context
+static std::unordered_map<std::string, std::shared_ptr<hvac_file_sync_context>> file_sync_map;
+static pthread_rwlock_t file_sync_map_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
 // Initialize shard rwlocks once
 void init_fd_state_rwlocks() {
@@ -169,6 +194,98 @@ void hvac_cleanup_fd_state(int fd) {
     pthread_rwlock_unlock(rwlock);
 }
 
+/* Per-file synchronization context management functions */
+
+// Get or create file sync context for a given filename
+std::shared_ptr<hvac_file_sync_context> hvac_get_file_sync_context(const std::string& filename) {
+    pthread_rwlock_rdlock(&file_sync_map_rwlock);
+    auto it = file_sync_map.find(filename);
+    if (it != file_sync_map.end()) {
+        auto context = it->second;
+        // Increment reference count
+        pthread_mutex_lock(&context->operation_mutex);
+        context->ref_count++;
+        pthread_mutex_unlock(&context->operation_mutex);
+        pthread_rwlock_unlock(&file_sync_map_rwlock);
+        return context;
+    }
+    pthread_rwlock_unlock(&file_sync_map_rwlock);
+    
+    // Need to create new context
+    pthread_rwlock_wrlock(&file_sync_map_rwlock);
+    // Double-check in case another thread created it
+    it = file_sync_map.find(filename);
+    if (it != file_sync_map.end()) {
+        auto context = it->second;
+        pthread_mutex_lock(&context->operation_mutex);
+        context->ref_count++;
+        pthread_mutex_unlock(&context->operation_mutex);
+        pthread_rwlock_unlock(&file_sync_map_rwlock);
+        return context;
+    }
+    
+    // Create new context
+    auto context = std::make_shared<hvac_file_sync_context>();
+    file_sync_map[filename] = context;
+    pthread_rwlock_unlock(&file_sync_map_rwlock);
+    return context;
+}
+
+// Release file sync context (decrement ref count and cleanup if needed)
+void hvac_release_file_sync_context(const std::string& filename, std::shared_ptr<hvac_file_sync_context> context) {
+    pthread_mutex_lock(&context->operation_mutex);
+    context->ref_count--;
+    bool should_cleanup = (context->ref_count <= 0);
+    pthread_mutex_unlock(&context->operation_mutex);
+    
+    if (should_cleanup) {
+        pthread_rwlock_wrlock(&file_sync_map_rwlock);
+        // Double-check ref count under write lock
+        pthread_mutex_lock(&context->operation_mutex);
+        if (context->ref_count <= 0) {
+            file_sync_map.erase(filename);
+        }
+        pthread_mutex_unlock(&context->operation_mutex);
+        pthread_rwlock_unlock(&file_sync_map_rwlock);
+    }
+}
+
+// Wait for file operation to complete using per-file sync context
+ssize_t hvac_wait_for_file_operation(std::shared_ptr<hvac_file_sync_context> context, const char* operation_name) {
+    pthread_mutex_lock(&context->operation_mutex);
+    
+    while (!context->operation_done) {
+        struct timespec timeout_ts;
+        clock_gettime(CLOCK_REALTIME, &timeout_ts);
+        timeout_ts.tv_sec += 10;  // 10 second timeout
+        
+        int ret = pthread_cond_timedwait(&context->operation_cond, &context->operation_mutex, &timeout_ts);
+        if (ret == ETIMEDOUT) {
+            L4C_ERR("SYNC_DEBUG: Timeout waiting for %s operation", operation_name);
+            pthread_mutex_unlock(&context->operation_mutex);
+            return -1;
+        }
+    }
+    
+    ssize_t result = context->operation_result;
+    
+    // Reset for next operation
+    context->operation_done = HG_FALSE;
+    context->operation_result = -1;
+    
+    pthread_mutex_unlock(&context->operation_mutex);
+    return result;
+}
+
+// Signal file operation completion
+void hvac_signal_file_operation_done(std::shared_ptr<hvac_file_sync_context> context, ssize_t result) {
+    pthread_mutex_lock(&context->operation_mutex);
+    context->operation_done = HG_TRUE;
+    context->operation_result = result;
+    pthread_cond_broadcast(&context->operation_cond);
+    pthread_mutex_unlock(&context->operation_mutex);
+}
+
 /* RPC Globals */
 static hg_id_t hvac_client_rpc_id;
 static hg_id_t hvac_client_open_id;
@@ -191,19 +308,22 @@ struct hvac_rpc_state {
     void *buffer;
     hg_bulk_t bulk_handle;
     hg_handle_t handle;
-    struct hvac_sync_context *sync_ctx;  // Individual sync context
+    std::shared_ptr<hvac_file_sync_context> file_sync_ctx;  // Per-file sync context
+    std::string filename;  // For cleanup purposes
 };
 
 // Carry CB Information for CB
 struct hvac_open_state{
     uint32_t local_fd;
-    struct hvac_sync_context *sync_ctx;  // Individual sync context
+    std::shared_ptr<hvac_file_sync_context> file_sync_ctx;  // Per-file sync context
+    std::string filename;  // For cleanup purposes
 };
 
 // Seek state structure
 struct hvac_seek_state{
     int fd;
-    struct hvac_sync_context *sync_ctx;  // Individual sync context
+    std::shared_ptr<hvac_file_sync_context> file_sync_ctx;  // Per-file sync context
+    std::string filename;  // For cleanup purposes
 };
 
 static hg_return_t
